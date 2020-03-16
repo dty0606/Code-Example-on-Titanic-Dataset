@@ -1,0 +1,561 @@
+---
+title: "Working example on Titanic dataset"
+author: "Terry Ding"
+output: html_document
+number_sections: TRUE
+fig_height: 4
+fig_width: 7
+code_folding: show
+---
+
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+
+
+```{r dependencies, message = FALSE, warning = FALSE}
+# data wrangling
+library(tidyverse)
+library(forcats)
+library(stringr)
+library(caTools)
+
+# data assessment/visualizations
+library(DT)
+library(data.table)
+library(pander)
+library(ggplot2)
+library(scales)
+library(grid)
+library(gridExtra)
+library(corrplot)
+library(VIM) 
+library(knitr)
+library(vcd)
+library(caret)
+
+
+# model
+library(glmnet) 
+library(xgboost)
+library(MLmetrics)
+library(randomForest) 
+library(rpart)
+library(rpart.plot)
+library(car)
+library(e1071)
+library(vcd)
+library(ROCR)
+library(pROC)
+library(VIM)
+
+```
+
+## Import data
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+#import data
+train <- read_csv('../data/train.csv')
+test  <- read_csv('../data/test.csv')
+
+#build full set for data clean
+train$input <- "train"
+test$input  <- "test"
+test$Survived <- NA
+full <- rbind(train, test)
+```
+
+
+### Quick check
+```{r , message=FALSE, warning=FALSE, results='hide'}
+# check data
+str(full)
+
+# dataset dimensions
+dim(full)
+
+# Unique values per column
+sapply(full, function(x) length(unique(x))) 
+
+#Check for Missing values
+sapply(full, function(x) nrow(full)-length(na.omit(x))) 
+miss_pct <- 
+  sapply(full, function(x) round(1-length(na.omit(x))/nrow(full),4))#missing percent
+miss_pct <- miss_pct[miss_pct != 0]
+data.frame(miss=miss_pct, var=names(miss_pct), row.names=NULL) %>%
+          ggplot(aes(x=reorder(var, -miss), y=miss)) + 
+          geom_bar(stat='identity', fill='red') +
+          labs(x='', y='% missing', title='Missing percent') +
+          theme(axis.text.x=element_text(angle=90, hjust=1))
+
+```
+
+
+### Feature Engineer
+```{r age, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+# Feature Engineer
+
+#fill missing age with mean in each age group (continuous)
+full <- full %>% mutate(Age = ifelse(is.na(Age), mean(full$Age, na.rm=TRUE), Age),
+                        Age_group = case_when(Age < 13 ~ "Age.0012", 
+                                                Age >= 13 & Age < 18 ~ "Age.1317",
+                                                Age >= 18 & Age < 60 ~ "Age.1859",
+                                                Age >= 60 ~ "Age.60Ov"))
+
+#fill missing Embarked with most common value (categorical)
+full$Embarked <- replace(full$Embarked, which(is.na(full$Embarked)), 'S')
+```
+
+```{r pp_titles, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#Name is with title, extract title for further study (feature engineer)
+names <- full$Name
+title <-  gsub("^.*, (.*?)\\..*$", "\\1", names)
+full$title <- title
+table(title)
+
+#merge bins with small number, rule of thumb is less than 5.
+#Miss
+full$title[full$title == 'Mlle'] <- 'Miss' 
+full$title[full$title == 'Ms'] <- 'Miss'
+full$title[full$title == 'Mme'] <- 'Mrs' 
+full$title[full$title == 'Lady'] <- 'Miss'
+full$title[full$title == 'Dona'] <- 'Miss'
+
+#Officer
+full$title[full$title == 'Capt'] <- 'Officer' 
+full$title[full$title == 'Col'] <- 'Officer' 
+full$title[full$title == 'Major'] <- 'Officer'
+full$title[full$title == 'Dr'] <- 'Officer'
+full$title[full$title == 'Rev'] <- 'Officer'
+full$title[full$title == 'Don'] <- 'Officer'
+full$title[full$title == 'Sir'] <- 'Officer'
+full$title[full$title == 'the Countess'] <- 'Officer'
+full$title[full$title == 'Jonkheer'] <- 'Officer'  
+```
+
+
+```{r pp_familygrp, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#Family size (feature engineer: create useful features by existing features)
+full$FamilySize <-full$SibSp + full$Parch + 1 
+full$FamilySized[full$FamilySize == 1] <- 'Single' 
+full$FamilySized[full$FamilySize < 5 & full$FamilySize >= 2] <- 'Small' 
+full$FamilySized[full$FamilySize >= 5] <- 'Big' 
+full$FamilySized=as.factor(full$FamilySized)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+##Engineer features based on all the passengers with the same ticket
+ticket.unique <- rep(0, nrow(full))
+tickets <- unique(full$Ticket)
+for (i in 1:length(tickets)) {
+  current.ticket <- tickets[i]
+  party.indexes <- which(full$Ticket == current.ticket)
+  for (k in 1:length(party.indexes)) {
+    ticket.unique[party.indexes[k]] <- length(party.indexes)
+  }
+}
+
+full$ticket.unique <- ticket.unique
+full$ticket.size[full$ticket.unique == 1] <- 'Single'
+full$ticket.size[full$ticket.unique < 5 & full$ticket.unique>= 2] <- 'Small'
+full$ticket.size[full$ticket.unique >= 5]  <- 'Big'
+```
+
+
+```{r iv, message=FALSE, warning=FALSE}
+#Format binary outcome
+full <- full %>% mutate(Survived = case_when(Survived==1 ~ "Yes", 
+                                             Survived==0 ~ "No"))
+
+crude_summary <- full %>% filter(input=="train") %>%
+                          select(PassengerId, Survived) %>%
+                          group_by(Survived) %>%
+                          summarise(n = n()) %>%
+                          mutate(freq = round(n / sum(n),4))
+crude_survrate <- crude_summary$freq[crude_summary$Survived=="Yes"]
+kable(crude_summary, caption="2x2 Contingency Table on Survival.", format="markdown")
+```
+
+## Exploratory data analysis
+
+### Survival rate by features' groups
+```{r rate_pclass, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#EDA(Exploratory data analysis of survival rate by groups)
+#By class
+ggplot(full %>% filter(input=="train"), aes(Pclass, fill=Survived)) +
+      geom_bar(position = "fill") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      ylab("Survival Rate") +
+      geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) + #overall survival rate
+      ggtitle("Survival Rate by Class") + 
+      theme_minimal()
+
+```
+
+
+```{r rate_sex, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By sex
+ggplot(full %>% filter(input=="train"), aes(Sex, fill=Survived)) +
+      geom_bar(position = "fill") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      ylab("Survival Rate") +
+      geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+      ggtitle("Survival Rate by Sex") + 
+      theme_minimal()
+
+```
+
+```{r rate_age, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By age distribution
+tbl_age <- full %>%
+  filter(input=="train") %>%
+  select(Age, Survived) %>%
+  group_by(Survived) %>%
+  summarise(mean.age = mean(Age, na.rm=TRUE))
+
+ggplot(full %>% filter(input=="train"), aes(Age, fill=Survived)) +
+  geom_histogram(aes(y=..density..), alpha=0.5) +
+  geom_density(alpha=.2, aes(colour=Survived)) +
+  geom_vline(data=tbl_age, aes(xintercept=mean.age, colour=Survived), lty=2, size=1) +
+  scale_fill_brewer(palette="Set2") +
+  scale_colour_brewer(palette="Set2") +
+  scale_y_continuous(labels=percent) +
+  ylab("Density") +
+  ggtitle("Survival Rate by Age") + 
+  theme_minimal()
+
+```
+
+
+```{r rate_age_group, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By age group
+ggplot(full %>% filter(input=="train" & !is.na(Age)), aes(Age_group, fill=Survived)) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette="Set2") +
+  scale_y_continuous(labels=percent) +
+  ylab("Survival Rate") +
+  geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+  ggtitle("Survival Rate by Age Group") + 
+  theme_minimal()
+
+```
+
+
+```{r rate_embarked, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By embarked
+ggplot(full %>% filter(input=="train"), aes(Embarked, fill=Survived)) +
+      geom_bar(position = "fill") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      ylab("Survival Rate") +
+      geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+      ggtitle("Survival Rate by Embarked") + 
+      theme_minimal()
+
+```
+
+
+```{r rate_title, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By title
+ggplot(full %>% filter(input=="train") %>% na.omit, aes(title, fill=Survived)) +
+      geom_bar(position="fill") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      ylab("Survival Rate") +
+      geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+      ggtitle("Survival Rate by Title") + 
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r rate_family, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By family size
+ggplot(full %>% filter(input=="train") %>% na.omit, aes(FamilySize, fill=Survived)) +
+      geom_bar(position="fill") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      ylab("Survival Rate") +
+      geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+      ggtitle("Survival Rate by Family Group") + 
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+```{r freq_pclass, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+ggplot(full %>% filter(input=="train"), aes(Pclass, fill=Survived)) +
+      geom_bar(position="stack") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=comma) +
+      ylab("Passengers") +
+      ggtitle("Survived by Class") + 
+      theme_minimal()
+
+```
+
+### Survival count by features' groups
+```{r freq_sex, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By sex
+ggplot(full %>% filter(input=="train"), aes(Sex, fill=Survived)) +
+      geom_bar(position="stack") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=percent) +
+      scale_y_continuous(labels=comma) +
+      ylab("Passengers") +
+      ggtitle("Survived by Sex") + 
+      theme_minimal()
+
+```
+
+
+```{r freq_age, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By age
+ggplot(full %>% filter(input=="train"), aes(Age, fill=Survived)) +
+      geom_histogram(aes(y=..count..), alpha=0.5) +
+      geom_vline(data=tbl_age, aes(xintercept=mean.age, colour=Survived), lty=2, size=1) +
+      scale_fill_brewer(palette="Set2") +
+      scale_colour_brewer(palette="Set2") +
+      scale_y_continuous(labels=comma) +
+      ylab("Density") +
+      ggtitle("Survived by Age") + 
+      theme_minimal()
+
+```
+
+```{r freq_age_group, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By age group
+ggplot(full %>% filter(input=="train" & !is.na(Age)), aes(Age_group, fill=Survived)) +
+  geom_bar(position="stack") +
+  scale_fill_brewer(palette="Set2") +
+  scale_y_continuous(labels=comma) +
+  ylab("Passengers") +
+  ggtitle("Survived by Age Group") + 
+  theme_minimal()
+```
+
+```{r freq_embarked, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By embarked
+ggplot(full %>% filter(input=="train"), aes(Embarked, fill=Survived)) +
+      geom_bar(position="stack") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=comma) +
+      ylab("Passengers") +
+      ggtitle("Survived by Embarked") + 
+      theme_minimal()
+
+```
+
+
+```{r freq_title, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By title
+ggplot(full %>% filter(input=="train") %>% na.omit, aes(title, fill=Survived)) +
+      geom_bar(position="stack") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=comma) +
+      ylab("Passengers") +
+      ggtitle("Survived by Title") + 
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r freq_family, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4.5, fig.width=9}
+#By family size
+ggplot(full %>% filter(input=="train") %>% na.omit, aes(`FamilySize`, fill=Survived)) +
+      geom_bar(position="stack") +
+      scale_fill_brewer(palette="Set2") +
+      scale_y_continuous(labels=comma) +
+      ylab("Passengers") +
+      ggtitle("Survived by Family Group") + 
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+## Correlation Study
+
+
+```{r corrplot, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4, fig.width=9}
+#Corrplot: remove id, sib, parch
+tbl_corr <- full %>%
+  filter(input=="train") %>%
+  select(-PassengerId, -SibSp, -Parch) %>%
+  select_if(is.numeric) %>%
+  cor(use="complete.obs") %>%
+  corrplot.mixed(tl.cex=0.85)
+```
+
+
+## Mosaic Plot
+
+**Explanation**:
+Mosaic plot (also known as Marimekko diagrams) is a graphical method for visualizing data from two or more qualitative variables. It is the multidimensional extension of spineplots, which graphically display the same information for only one variable.
+[linked phrase](https://en.wikipedia.org/wiki/Mosaic_plot)
+
+
+```{r mosaicplot, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4, fig.width=9}
+tbl_mosaic <- full %>% filter(input=="train") %>%
+              select(Survived, Pclass, Sex, AgeGroup=Age_group, title, Embarked, `FamilySize`) %>%
+              mutate_all(as.factor)
+mosaic(~Pclass+Sex+Survived, data=tbl_mosaic, shade=TRUE, legend=TRUE)
+```
+
+## Machine learning algorithm                                                                                
+
+```{r, message=FALSE, warning=FALSE}
+###feature selection set 1, data preparation for models
+feature1<-full[full$input == 'train', 
+               c("Pclass", "title","Sex","Embarked","FamilySized","ticket.size")]
+response <- as.factor(train$Survived)
+feature1$Survived=as.factor(train$Survived)
+
+###train validation split, 0.8/0.2
+set.seed(666)
+ind <- sample(1:nrow(feature1), 0.8*nrow(feature1))
+train_set <- feature1[ind,]
+val_set <- feature1[-ind,]
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+##Decision tree
+set.seed(666)
+Model_DT <- rpart(Survived~., data = train_set, method="class")
+rpart.plot(Model_DT,extra = 3,fallen.leaves = T)
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+#test on validation
+PRE_TDT <- predict(Model_DT, newdata = val_set, type="class")
+confusionMatrix(PRE_TDT, val_set$Survived)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+##Random Forest
+set.seed(666)
+#factorize train set to fit in random forest
+temp <- as.data.frame(lapply(train_set, function(x) as.factor(x)))
+rf.1 <- randomForest(x = temp[,-7],y=temp$Survived, importance = TRUE, ntree = 1000)
+rf.1
+varImpPlot(rf.1)
+
+
+
+###Lets Predict the test data 
+val <- as.data.frame(lapply(val_set, function(x) as.factor(x)))
+pr.rf <- predict(rf.1,newdata = val)
+
+confusionMatrix(pr.rf, val$Survived)
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#Ridge/lasso regularizd regression
+set.seed(666)
+
+
+#cross validation glmnet, tuning alpha to get ridge or lasso
+x <- data.matrix(temp[,-7])
+cvfit.ridge <- cv.glmnet(x, temp$Survived, 
+                    family = "binomial", 
+                    alpha = 0,
+                    type.measure = "class")
+
+cvfit.lasso <- cv.glmnet(x, temp$Survived, 
+                          family = "binomial", 
+                          alpha = 1,
+                          type.measure = "class")
+
+par(mfrow=c(1,2))
+plot(cvfit.ridge, main = "Ridge")
+plot(cvfit.lasso, main = "Lasso")
+coef(cvfit.ridge, s = "lambda.min")
+
+# Prediction on validation set, ridge
+ridge.model <- predict(cvfit.ridge, newx=data.matrix(val[,-7]), type="class")
+confusionMatrix(val$Survived, as.factor(ridge.model))
+
+#lasso
+lasso.model <- predict(cvfit.lasso, newx=data.matrix(val[,-7]), type="class")
+confusionMatrix(val$Survived, as.factor(lasso.model))
+```
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+##support vector machine 
+set.seed(666)
+
+liner.tune <- tune.svm(Survived~.,data=temp,
+                       kernel="linear",
+                       cost=c(0.01,0.1,0.2,0.5,0.7,1,2,3,5,10,15,20,50,100))
+liner.tune
+
+###Lets get a best.liner model  
+best.linear <- liner.tune$best.model
+
+##Predict Survival rate using test data
+best.test <- predict(best.linear,newdata=val,type="class")
+confusionMatrix(best.test,val$Survived)
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+##XGBoost
+sparse_train <- sparse.model.matrix(Survived ~ ., data = train_set)[,-1]
+sparse_val <- sparse.model.matrix(Survived ~ ., data = val_set)[,-1]
+
+dtrain <- xgb.DMatrix(data = sparse_train, label = as.numeric(train_set$Survived)-1)
+dval <- xgb.DMatrix(data = sparse_val, label = as.numeric(val_set$Survived)-1)
+
+watchlist <- list(train=dtrain, test=dval)
+
+##XGB params
+params <- list("eta"=0.01,
+               "max_depth"=8,
+               "colsample_bytree"=0.3528,
+               "min_child_weight"=1,
+               "subsample"=1,
+               "objective"="binary:logistic",
+               "eval_metric"="auc")
+
+##train xgb
+model_xgb <- xgb.train(params = params,
+                       data = dtrain,
+                       maximize = TRUE,
+                       nrounds = 100,
+                       watchlist = watchlist,
+                       early_stopping_round = 80,
+                       print_every_n=2)
+
+  
+pred <- as.factor((predict(model_xgb, dval, type="class") > 0.5) * 1)
+confusionMatrix(pred, val$Survived)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
